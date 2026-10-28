@@ -1,5 +1,4 @@
 import AppKit
-import OSLog
 
 @MainActor
 public func makeIcon(

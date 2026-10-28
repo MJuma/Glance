@@ -19,6 +19,29 @@ import Testing
     #expect(ThermalPressureReader.pressure(for: 99) == nil)
 }
 
+@Test(arguments: [
+    "MacBookAir10,1", "Mac14,2", "Mac14,15", "Mac15,12", "Mac15,13",
+    "Mac16,12", "Mac16,13", "Mac17,3", "Mac17,4"
+])
+func appleSiliconMacBookAirModelsAreKnownFanless(model: String) {
+    #expect(SMCReader.isKnownFanlessModel(model))
+}
+
+@Test(arguments: ["MacBookAir9,1", "MacBookAir8,1", "Mac15,3", "Mac14,3", "Mac18,99", ""])
+func otherHardwareIsNotAssumedFanless(model: String) {
+    #expect(!SMCReader.isKnownFanlessModel(model))
+}
+
+@Test @MainActor func absentFansHaveNoMenuItem() {
+    #expect(makeFanMenuItem(for: .notPresent) == nil)
+}
+
+@Test @MainActor func fanReadingsAndReadFailuresStillHaveMenuItems() {
+    let fan = FanSpeed(rpm: 2_000, percentage: 20)
+    #expect(makeFanMenuItem(for: .available(fan))?.title == "Fan: 2000 RPM (20%)")
+    #expect(makeFanMenuItem(for: .unavailable("Sensor read failed"))?.title == "Fan: Unavailable")
+}
+
 @Test @MainActor func failedMemorySamplingClearsStaleSuccessAndCanRecover() {
     let fail = Mutex(false)
     let monitor = MemoryMonitor {
@@ -82,7 +105,16 @@ func localHardwareBridgeDecodesExpectedLiveReadings() throws {
     #expect(thermal.cpuMax != nil)
     #expect(thermal.gpuMax != nil)
     #expect(thermal.sensorCount > 0)
-    if case let .unavailable(message) = thermal.fanState {
+    if SMCReader.isKnownFanlessModel(try SMCReader.readHardwareModel()) {
+        if case .notPresent = thermal.fanState {
+            #expect(thermal.fanRPM == nil)
+            #expect(thermal.fanPercent == nil)
+            #expect(makeFanMenuItem(for: thermal.fanState) == nil)
+            #expect(thermal.issue?.localizedCaseInsensitiveContains("fan") != true)
+        } else {
+            Issue.record("A known fanless Mac reported a fan reading or fan error.")
+        }
+    } else if case let .unavailable(message) = thermal.fanState {
         #expect(!message.isEmpty)
         #expect(thermal.issue?.contains(message) == true)
     }

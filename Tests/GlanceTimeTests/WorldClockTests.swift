@@ -4,7 +4,7 @@ import Synchronization
 import Testing
 @testable import GlanceTime
 
-private struct ClockSettingsFixture {
+struct ClockSettingsFixture {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("glance-clocks-\(UUID().uuidString)")
     var configURL: URL { directory.appendingPathComponent("clocks.json") }

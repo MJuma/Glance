@@ -1,0 +1,3 @@
+--swiftversion 6
+--rules indent,trailingSpace,linebreakAtEndOfFile,consecutiveBlankLines
+--exclude .build,build,dist,BuildTools/.build

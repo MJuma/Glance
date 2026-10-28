@@ -1,6 +1,24 @@
 import AppKit
 import Darwin
 
+enum MonitorSampling {
+    static let interval: TimeInterval = 10
+    static let maximumGap: TimeInterval = 30
+}
+
+@MainActor
+func makeMonitorPollingTimer(
+    interval: TimeInterval = MonitorSampling.interval,
+    poll: @escaping @MainActor @Sendable () -> Void
+) -> Timer {
+    let timer = Timer(timeInterval: interval, repeats: true) { _ in
+        MainActor.assumeIsolated { poll() }
+    }
+    timer.tolerance = interval / 10
+    RunLoop.main.add(timer, forMode: .common)
+    return timer
+}
+
 struct MemorySnapshot: Sendable {
     var usedPercent: Int = 0
     var activeGB: Double = 0
@@ -66,9 +84,6 @@ struct MemorySnapshot: Sendable {
         let wired = UInt64(vmInfo.wire_count) * bytesPerPage
         let compressed = UInt64(vmInfo.compressor_page_count) * bytesPerPage
         let inactive = UInt64(vmInfo.inactive_count) * bytesPerPage
-        let free = UInt64(vmInfo.free_count) * bytesPerPage
-        let speculative = UInt64(vmInfo.speculative_count) * bytesPerPage
-        let purgeable = UInt64(vmInfo.purgeable_count) * bytesPerPage
         let usedPercent = Int((active + wired + compressed) * 100 / totalRAM)
         let pressure: Pressure
         let pressureIssue: String?
@@ -86,13 +101,18 @@ struct MemorySnapshot: Sendable {
             wiredGB: Double(wired) / gb,
             compressedGB: Double(compressed) / gb,
             inactiveGB: Double(inactive) / gb,
-            availableGB: Double(free + inactive + purgeable + speculative) / gb,
+            availableGB: Double(availableBytes(in: vmInfo, pageSize: bytesPerPage)) / gb,
             swapUsedMB: Int(swap.xsu_used / 1_048_576),
             totalGB: Int(totalRAM / 1_073_741_824),
             freePercent: max(0, 100 - usedPercent),
             pressure: pressure,
             pressureIssue: pressureIssue
         )
+    }
+
+    static func availableBytes(in statistics: vm_statistics64, pageSize: UInt64) -> UInt64 {
+        // Free already includes speculative pages; purgeable pages can overlap other counters.
+        (UInt64(statistics.free_count) + UInt64(statistics.inactive_count)) * pageSize
     }
 }
 
@@ -244,20 +264,7 @@ final class ThermalMonitor {
         if history.count > 121 { history.removeFirst(history.count - 121) }
     }
 
-    var timeInEachState: [(pressure: ThermalPressure, duration: TimeInterval)] {
-        guard history.count >= 2 else { return [] }
-        var durations: [ThermalPressure: TimeInterval] = [:]
-        for index in 0..<(history.count - 1) {
-            durations[history[index].pressure, default: 0] +=
-                history[index + 1].timestamp.timeIntervalSince(history[index].timestamp)
-        }
-        if let last = history.last {
-            durations[last.pressure, default: 0] += Date().timeIntervalSince(last.timestamp)
-        }
-        return durations.map { ($0.key, $0.value) }.sorted { $0.1 > $1.1 }
-    }
-
-    var totalHistoryDuration: TimeInterval {
-        history.first.map { Date().timeIntervalSince($0.timestamp) } ?? 0
+    func historySummary(at now: Date = Date()) -> ThermalHistorySummary {
+        ThermalHistorySummary(history: history, now: now)
     }
 }

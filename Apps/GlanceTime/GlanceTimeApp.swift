@@ -3,16 +3,22 @@ import GlanceSupport
 
 @MainActor
 final class TimeAppDelegate: NSObject, NSApplicationDelegate {
-    private let worldClock = WorldClockMonitor()
+    private let worldClock: WorldClockMonitor
     private var statusItem: NSStatusItem!
     private var timeMenu: TimeAndDateMenu?
     private var addClockPopover: AddClockPopover?
+
+    init(worldClock: WorldClockMonitor = WorldClockMonitor()) {
+        self.worldClock = worldClock
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let timeMenu = TimeAndDateMenu(worldClock: worldClock) { [weak self] in
             self?.showAddClock()
         }
         timeMenu.menu.addItem(.separator())
+        timeMenu.menu.addItem(makeAboutItem(applicationName: "Glance Time"))
         timeMenu.menu.addItem(makeMenuItem(
             "Quit Glance Time",
             action: #selector(quit),
@@ -27,6 +33,11 @@ final class TimeAppDelegate: NSObject, NSApplicationDelegate {
         )
         statusItem.button?.toolTip = "Glance Time"
         statusItem.menu = timeMenu.menu
+        #if DEBUG
+            if DebugLifecycleHarness.isRequested {
+                DebugLifecycleHarness.run { try await self.runLifecycleSmokeTest() }
+            }
+        #endif
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -46,6 +57,29 @@ final class TimeAppDelegate: NSObject, NSApplicationDelegate {
     @objc private func quit() {
         NSApp.terminate(nil)
     }
+
+    #if DEBUG
+        private func runLifecycleSmokeTest() async throws {
+            try await DebugLifecycleHarness.waitUntil { self.statusItem.button?.window != nil }
+            let button = try DebugLifecycleHarness.value(statusItem.button, "Smoke status button is unavailable")
+            let timeMenu = try DebugLifecycleHarness.value(timeMenu, "Smoke Time menu is unavailable")
+            for _ in 0..<2 {
+                try await DebugLifecycleHarness.track(timeMenu.menu, relativeTo: button) {
+                    timeMenu.hasContent && (timeMenu.menu.items.first?.view?.frame.height ?? 0) > 100
+                }
+                try await DebugLifecycleHarness.waitUntil { !timeMenu.hasContent }
+                showAddClock()
+                try await DebugLifecycleHarness.waitUntil { self.addClockPopover?.shownForSmokeTest == true }
+                addClockPopover?.dismiss()
+                try await DebugLifecycleHarness.waitUntil { self.addClockPopover?.hasContent == false }
+            }
+            worldClock.addClock(label: "UTC", timezoneID: "Etc/UTC")
+            try DebugLifecycleHarness.require(worldClock.clocks.count == 1, "Fixture clock was not saved")
+            worldClock.removeClock(at: 0)
+            try DebugLifecycleHarness.require(worldClock.clocks.isEmpty, "Fixture clock was not removed")
+            applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+        }
+    #endif
 }
 
 @main
@@ -54,9 +88,23 @@ struct GlanceTimeApp {
     static func main() {
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
-        let delegate = TimeAppDelegate()
+        guard let instanceLock = claimPrimaryApplicationInstance() else { return }
+        let delegate: TimeAppDelegate
+        #if DEBUG
+            if DebugLifecycleHarness.isRequested {
+                do {
+                    delegate = TimeAppDelegate(worldClock: WorldClockMonitor(configURL: try DebugLifecycleHarness.clockSettingsURL()))
+                } catch {
+                    DebugLifecycleHarness.fail(error)
+                }
+            } else {
+                delegate = TimeAppDelegate()
+            }
+        #else
+            delegate = TimeAppDelegate()
+        #endif
         application.delegate = delegate
-        withExtendedLifetime(delegate) {
+        withExtendedLifetime((delegate, instanceLock)) {
             application.run()
         }
     }

@@ -1,7 +1,8 @@
 import Darwin
+import Foundation
 import GlancePlatform
+import GlanceSupport
 import IOKit
-import OSLog
 
 struct TelemetryIssue: Error, LocalizedError, Equatable {
     let message: String
@@ -31,15 +32,14 @@ enum MemoryPressureCompatibility {
 
 @MainActor
 struct TelemetryDiagnostics {
-    private let logger = Logger(subsystem: "com.local.glance.monitor", category: "telemetry")
     private var lastMessage: String?
 
     mutating func report(_ message: String?) {
         guard message != lastMessage else { return }
         if let message {
-            logger.error("\(message, privacy: .public)")
+            AppLog.telemetry.error("\(message, privacy: .public)")
         } else {
-            logger.debug("Telemetry recovered")
+            AppLog.telemetry.debug("Telemetry recovered")
         }
         lastMessage = message
     }
@@ -123,6 +123,7 @@ final class SMCReader {
     private var connection: io_connect_t = 0
     private var connectionIssue: String?
     private var cachedFanCount: Int?
+    private let isKnownFanless: Bool
 
     private static let temperatureKeys: [String] = {
         var keys: Set<String> = [
@@ -143,6 +144,12 @@ final class SMCReader {
     }()
 
     private init() {
+        do {
+            isKnownFanless = Self.isKnownFanlessModel(try Self.readHardwareModel())
+        } catch {
+            isKnownFanless = false
+            AppLog.telemetry.error("Fanless model identification unavailable: \(error.localizedDescription, privacy: .public)")
+        }
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
         guard service != 0 else {
             connectionIssue = "AppleSMC is not available on this Mac."
@@ -162,7 +169,7 @@ final class SMCReader {
     func readAllTemperatures() throws -> [(key: String, value: Double)] {
         var readings: [(String, Double)] = []
         for key in Self.temperatureKeys {
-            if let value = try readNumber(key), (20..<150).contains(value) {
+            if let value = try readNumber(key), Self.isValidTemperature(value) {
                 readings.append((key, value))
             }
         }
@@ -172,7 +179,42 @@ final class SMCReader {
         return readings
     }
 
+    nonisolated static func isValidTemperature(_ value: Double) -> Bool {
+        value.isFinite && (-40..<150).contains(value)
+    }
+
+    nonisolated static func isKnownFanlessModel(_ model: String) -> Bool {
+        // Apple-silicon MacBook Air identifiers: https://support.apple.com/en-us/102869
+        switch model {
+        case "MacBookAir10,1", "Mac14,2", "Mac14,15", "Mac15,12", "Mac15,13",
+             "Mac16,12", "Mac16,13", "Mac17,3", "Mac17,4":
+            true
+        default:
+            false
+        }
+    }
+
+    nonisolated static func readHardwareModel() throws -> String {
+        var size = 0
+        guard sysctlbyname("hw.model", nil, &size, nil, 0) == 0, size > 1 else {
+            throw TelemetryIssue(message: "Mac hardware model is unavailable (errno \(errno)).")
+        }
+        var bytes = [UInt8](repeating: 0, count: size)
+        let result = bytes.withUnsafeMutableBytes {
+            sysctlbyname("hw.model", $0.baseAddress, &size, nil, 0)
+        }
+        guard result == 0 else {
+            throw TelemetryIssue(message: "Mac hardware model is unavailable (status \(result), errno \(errno)).")
+        }
+        guard size > 1, size <= bytes.count, bytes[size - 1] == 0,
+              let model = String(bytes: bytes.prefix(size - 1), encoding: .utf8) else {
+            throw TelemetryIssue(message: "macOS returned an invalid hardware model.")
+        }
+        return model
+    }
+
     func readFanSpeed() throws -> FanSpeed? {
+        guard !isKnownFanless else { return nil }
         let count: Int
         if let cachedFanCount {
             count = cachedFanCount

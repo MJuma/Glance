@@ -1,11 +1,25 @@
 import AppKit
 import GlanceSupport
-import OSLog
+
+@MainActor
+func makeFanMenuItem(for state: FanState) -> NSMenuItem? {
+    switch state {
+    case .notPresent:
+        nil
+    case let .available(fan):
+        makeMonoItem(
+            String(format: "Fan: %.0f RPM (%.0f%%)", fan.rpm, fan.percentage),
+            color: .systemCyan
+        )
+    case .unavailable:
+        makeMonoItem("Fan: Unavailable")
+    }
+}
 
 @MainActor
 final class MonitorAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private let memory = MemoryMonitor()
-    private let thermal = ThermalMonitor()
+    private let memory: MemoryMonitor
+    private let thermal: ThermalMonitor
     private var statusItem: NSStatusItem!
     private let overviewMenu = NSMenu()
     private let memoryMenu = NSMenu()
@@ -14,12 +28,20 @@ final class MonitorAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     private var openMenus: Set<ObjectIdentifier> = []
     private var lastStatusPresentationKey: String?
     private var processListTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+    private static let processRowTag = 10
+
+    init(memory: MemoryMonitor = MemoryMonitor(), thermal: ThermalMonitor = ThermalMonitor()) {
+        self.memory = memory
+        self.thermal = thermal
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.menu = overviewMenu
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        overviewMenu.addItem(makeInfoItem("Glance Monitor"))
         thermalMenu.addItem(makeInfoItem("Thermal Details"))
         memoryMenu.addItem(makeInfoItem("Memory Details"))
         for menu in [overviewMenu, thermalMenu, memoryMenu] {
@@ -29,16 +51,18 @@ final class MonitorAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         thermal.poll()
         updateStatusItem()
 
-        let timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                self.memory.poll()
-                self.thermal.poll()
-                self.updateStatusItem()
-            }
+        let timer = makeMonitorPollingTimer { [weak self] in
+            guard let self else { return }
+            self.memory.poll()
+            self.thermal.poll()
+            self.updateStatusItem()
         }
-        timer.tolerance = 1
         timers.append(timer)
+        #if DEBUG
+            if DebugLifecycleHarness.isRequested {
+                DebugLifecycleHarness.run { try await self.runLifecycleSmokeTest() }
+            }
+        #endif
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -288,26 +312,23 @@ final class MonitorAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
                 color: .labelColor
             ))
         }
-        if let rpm = snapshot.fanRPM, let percent = snapshot.fanPercent {
-            thermalMenu.addItem(makeMonoItem(
-                String(format: "Fan: %.0f RPM (%.0f%%)", rpm, percent),
-                color: .systemCyan
-            ))
-        } else {
-            let label = if case .notPresent = snapshot.fanState { "Fan: Not installed" } else { "Fan: Unavailable" }
-            thermalMenu.addItem(makeMonoItem(label))
+        if let fanItem = makeFanMenuItem(for: snapshot.fanState) {
+            thermalMenu.addItem(fanItem)
         }
         if thermal.history.count >= 2 {
             thermalMenu.addItem(.separator())
+            let now = Date()
             let graph = ThermalGraphView(
-                history: thermal.history
+                history: thermal.history,
+                now: now
             )
             let graphItem = NSMenuItem()
             graphItem.view = graph
             thermalMenu.addItem(graphItem)
+            let summary = thermal.historySummary(at: now)
             let breakdown = ThermalBreakdownView(
-                timeInEachState: thermal.timeInEachState,
-                totalDuration: thermal.totalHistoryDuration
+                timeInEachState: summary.timeInEachState,
+                totalDuration: summary.totalDuration
             )
             let breakdownItem = NSMenuItem()
             breakdownItem.view = breakdown
@@ -333,6 +354,7 @@ final class MonitorAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
 
     private func addApplicationActions(to menu: NSMenu) {
         menu.addItem(.separator())
+        menu.addItem(makeAboutItem(applicationName: "Glance Monitor"))
         menu.addItem(makeMenuItem(
             "Quit Glance Monitor",
             action: #selector(quit),
@@ -355,17 +377,17 @@ final class MonitorAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
                 guard index >= 0 else { return }
                 menu.removeItem(placeholder)
                 for (offset, label) in labels.enumerated() {
-                    menu.insertItem(makeMonoItem(label), at: index + offset)
+                    let row = makeMonoItem(label)
+                    row.tag = Self.processRowTag
+                    menu.insertItem(row, at: index + offset)
                 }
-                Logger(subsystem: "com.local.glance.monitor", category: "processes")
-                    .debug("Loaded \(labels.count, privacy: .public) process rows")
+                AppLog.processes.debug("Loaded \(labels.count, privacy: .public) process rows")
             } catch is CancellationError {
                 // Closing or rebuilding the menu intentionally cancels its request.
             } catch {
                 guard let self, let placeholder, menu != nil,
                       self.openMenus.contains(identifier) else { return }
-                Logger(subsystem: "com.local.glance.monitor", category: "processes")
-                    .error("Process list failed: \(error.localizedDescription, privacy: .public)")
+                AppLog.processes.error("Process list failed: \(error.localizedDescription, privacy: .public)")
                 placeholder.attributedTitle = makeInfoItem(
                     "Could not load processes. Reopen to retry.",
                     color: .systemOrange
@@ -396,6 +418,47 @@ final class MonitorAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     @objc private func quit() {
         NSApp.terminate(nil)
     }
+
+    #if DEBUG
+        private func runLifecycleSmokeTest() async throws {
+            try await DebugLifecycleHarness.waitUntil { self.statusItem.button?.window != nil }
+            let button = try DebugLifecycleHarness.value(statusItem.button, "Smoke status button is unavailable")
+            memory.poll()
+            thermal.poll()
+            DebugLifecycleHarness.note("Monitor native overview")
+            try await DebugLifecycleHarness.track(overviewMenu, relativeTo: button) {
+                self.openMenus.contains(ObjectIdentifier(self.overviewMenu))
+            }
+            try await DebugLifecycleHarness.waitUntil { self.openMenus.isEmpty }
+            for _ in 0..<2 {
+                for menu in [thermalMenu, memoryMenu] {
+                    DebugLifecycleHarness.note(menu === thermalMenu ? "Monitor thermal view lifecycle" : "Monitor memory view lifecycle")
+                    menuWillOpen(menu)
+                    for view in menu.items.compactMap(\.view) {
+                        let bitmap = try DebugLifecycleHarness.value(
+                            view.bitmapImageRepForCachingDisplay(in: view.bounds),
+                            "Could not render a detail view into its local bitmap"
+                        )
+                        view.cacheDisplay(in: view.bounds, to: bitmap)
+                    }
+                    try await DebugLifecycleHarness.waitUntil {
+                        menu.items.filter { $0.tag == Self.processRowTag }.count == 5
+                    }
+                    try DebugLifecycleHarness.require(menu.items.contains {
+                        ($0.view as? ThermalGraphView)?.renderedForSmokeTest == true ||
+                            ($0.view as? MemoryHistoryGraphView)?.renderedForSmokeTest == true
+                    }, "A detail graph did not draw")
+                    menuDidClose(menu)
+                    try await DebugLifecycleHarness.waitUntil {
+                        !self.openMenus.contains(ObjectIdentifier(menu)) &&
+                            menu.items.allSatisfy { $0.view == nil }
+                    }
+                }
+            }
+            try DebugLifecycleHarness.require(processListTasks.isEmpty, "A menu request survived tracking teardown")
+            applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+        }
+    #endif
 }
 
 @main
@@ -404,9 +467,30 @@ struct GlanceMonitorApp {
     static func main() {
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
-        let delegate = MonitorAppDelegate()
+        guard let instanceLock = claimPrimaryApplicationInstance() else { return }
+        let delegate: MonitorAppDelegate
+        #if DEBUG
+            if DebugLifecycleHarness.isRequested {
+                delegate = MonitorAppDelegate(
+                    memory: MemoryMonitor {
+                        MemorySnapshot(usedPercent: 25, activeGB: 4, totalGB: 16, freePercent: 75, pressure: .normal)
+                    },
+                    thermal: ThermalMonitor {
+                        ThermalSnapshot(
+                            pressure: .nominal, cpuMax: 55, cpuAvg: 50, gpuMax: 45,
+                            batteryTemp: 30, sensorCount: 4,
+                            fanState: .available(FanSpeed(rpm: 2_000, percentage: 20))
+                        )
+                    }
+                )
+            } else {
+                delegate = MonitorAppDelegate()
+            }
+        #else
+            delegate = MonitorAppDelegate()
+        #endif
         application.delegate = delegate
-        withExtendedLifetime(delegate) {
+        withExtendedLifetime((delegate, instanceLock)) {
             application.run()
         }
     }

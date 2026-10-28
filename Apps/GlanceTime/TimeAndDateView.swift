@@ -1,5 +1,5 @@
 import AppKit
-import OSLog
+import GlanceSupport
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -29,8 +29,7 @@ final class TimeAndDateMenu: NSObject, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         isOpen = true
         prepareContent()
-        Logger(subsystem: "com.local.glance.time", category: "menus")
-            .debug("Time menu opened")
+        AppLog.menus.debug("Time menu opened")
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -39,8 +38,7 @@ final class TimeAndDateMenu: NSObject, NSMenuDelegate {
             guard let self, !self.isOpen else { return }
             self.contentItem.view = nil
             self.hostingView = nil
-            Logger(subsystem: "com.local.glance.time", category: "menus")
-                .debug("Time menu closed and content released")
+            AppLog.menus.debug("Time menu closed and content released")
         }
     }
 
@@ -116,8 +114,9 @@ struct TimeAndDateView: View {
     }
 
     var body: some View {
+        let selectedDate = ClockTime.date(forLocalMinute: scrubMinute, relativeTo: now, calendar: calendar)
         VStack(spacing: 10) {
-            worldClockSection
+            worldClockSection(at: selectedDate)
             if let error = worldClock.persistenceError {
                 Text(error)
                     .font(.caption)
@@ -146,7 +145,7 @@ struct TimeAndDateView: View {
         }
     }
 
-    private var worldClockSection: some View {
+    private func worldClockSection(at date: Date) -> some View {
         VStack(spacing: 8) {
             HStack {
                 Label("World Clocks", systemImage: "globe.americas.fill")
@@ -168,7 +167,8 @@ struct TimeAndDateView: View {
             VStack(spacing: 8) {
                 TimeScrubberRepresentable(
                     minute: $scrubMinute,
-                    currentMinute: worldClock.currentMinuteOfDay
+                    now: now,
+                    calendar: calendar
                 )
                 .frame(height: 38)
                 .padding(.horizontal, 8)
@@ -179,7 +179,7 @@ struct TimeAndDateView: View {
                         Array(worldClock.clocks.enumerated()),
                         id: \.element.id
                     ) { index, clock in
-                        clockRow(clock, at: index)
+                        clockRow(clock, at: index, date: date)
                             .onDrag {
                                 draggedClockIndex = index
                                 return NSItemProvider(
@@ -200,9 +200,8 @@ struct TimeAndDateView: View {
         }
     }
 
-    private func clockRow(_ clock: ClockEntry, at index: Int) -> some View {
-        let minute = scrubMinute
-        let hour = worldClock.hour(for: clock, atLocalMinute: minute)
+    private func clockRow(_ clock: ClockEntry, at index: Int, date: Date) -> some View {
+        let hour = worldClock.hour(for: clock, at: date)
         let daytime = WorldClockMonitor.isDaytime(hour: hour)
 
         return HStack(spacing: 10) {
@@ -224,7 +223,7 @@ struct TimeAndDateView: View {
                 Text(clock.label)
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
-                Text(clockDayLabel(clock, atLocalMinute: minute))
+                Text(clockDayLabel(clock, at: date))
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)
             }
@@ -233,7 +232,7 @@ struct TimeAndDateView: View {
 
             Text(worldClock.timeString(
                 for: clock,
-                atLocalMinute: minute
+                at: date
             ))
             .font(.system(size: 16, weight: .semibold, design: .rounded))
             .monospacedDigit()
@@ -327,7 +326,7 @@ struct TimeAndDateView: View {
 
                 Text(
                     "Week \(calendar.component(.weekOfYear, from: now)) " +
-                    "of \(calendar.component(.yearForWeekOfYear, from: now))"
+                        "of \(calendar.component(.yearForWeekOfYear, from: now))"
                 )
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
@@ -368,8 +367,8 @@ struct TimeAndDateView: View {
                         isToday
                             ? Color.white
                             : inDisplayedMonth
-                                ? Color.primary
-                                : Color.secondary.opacity(0.4)
+                            ? Color.primary
+                            : Color.secondary.opacity(0.4)
                     )
             }
             .frame(maxWidth: .infinity, minHeight: 25)
@@ -380,17 +379,8 @@ struct TimeAndDateView: View {
 
     private func clockDayLabel(
         _ clock: ClockEntry,
-        atLocalMinute minute: Int?
+        at date: Date
     ) -> String {
-        let date: Date
-        if let minute {
-            let currentMinute = worldClock.currentMinuteOfDay
-            date = Date().addingTimeInterval(
-                TimeInterval((minute - currentMinute) * 60)
-            )
-        } else {
-            date = Date()
-        }
         var timezoneCalendar = Calendar.current
         timezoneCalendar.timeZone = clock.timezone
         let weekday = timezoneCalendar.component(.weekday, from: date)
@@ -462,7 +452,8 @@ struct TimeAndDateView: View {
 
 private struct TimeScrubberRepresentable: NSViewRepresentable {
     @Binding var minute: Int?
-    let currentMinute: Int
+    let now: Date
+    let calendar: Calendar
 
     func makeCoordinator() -> Coordinator {
         Coordinator(minute: $minute)
@@ -470,7 +461,9 @@ private struct TimeScrubberRepresentable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> TimeScrubber {
         let scrubber = TimeScrubber(frame: .zero)
-        scrubber.minuteOfDay = currentMinute
+        scrubber.calendar = calendar
+        scrubber.referenceDate = now
+        scrubber.minuteOfDay = minute ?? ClockTime.minuteOfDay(at: now, calendar: calendar)
         scrubber.onChanged = { value in
             context.coordinator.minute.wrappedValue = value
         }
@@ -482,7 +475,9 @@ private struct TimeScrubberRepresentable: NSViewRepresentable {
 
     func updateNSView(_ scrubber: TimeScrubber, context: Context) {
         context.coordinator.minute = $minute
-        scrubber.minuteOfDay = minute ?? currentMinute
+        scrubber.calendar = calendar
+        scrubber.referenceDate = now
+        scrubber.minuteOfDay = minute ?? ClockTime.minuteOfDay(at: now, calendar: calendar)
     }
 
     final class Coordinator {

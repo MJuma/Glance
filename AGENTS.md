@@ -10,6 +10,9 @@ Two independent macOS menu-bar applications share this repository:
 
 ```bash
 swift test
+swift -swift-version 6 Scripts/test-packaging.swift
+bash Scripts/test-release-guards.sh
+swift run --package-path BuildTools swiftformat --lint . --swiftversion 6
 bash Scripts/build-apps.sh
 ```
 
@@ -56,3 +59,17 @@ block the main actor waiting for a subprocess or add process-list idle polling.
 
 Preserve the MIT license and third-party notices. Include both LICENSE and
 THIRD_PARTY_NOTICES.md in each distributed app bundle.
+
+Use the shared civil-time resolver for scrubber labels and clock rows. Validate
+saved timezone identifiers instead of substituting local time. Monitor timers
+must run in common modes; use the shared sample-gap cap for graphs and observed
+thermal durations. Build complete app bundles in fresh staging directories.
+
+Acquire the per-bundle kernel instance lock before constructing models. Never
+use a saved PID or PID order as ownership proof, and never unlink a live lock.
+Keep developer dependencies in BuildTools, outside the app package.
+
+Build version/revision/time metadata into bundles; never run Git on app startup.
+Release archives must verify signatures, extracted contents and checksums.
+Keep UI lifecycle harnesses behind DEBUG, with isolated bundle IDs, synthetic
+telemetry and temporary settings. Do not request extra permissions for tests.

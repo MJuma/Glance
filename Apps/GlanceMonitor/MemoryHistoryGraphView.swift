@@ -5,6 +5,9 @@ final class MemoryHistoryGraphView: NSView {
     private let now: Date
     private var tracking: NSTrackingArea?
     private var selectedIndex: Int?
+    #if DEBUG
+        private(set) var renderedForSmokeTest = false
+    #endif
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -55,6 +58,9 @@ final class MemoryHistoryGraphView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        #if DEBUG
+            renderedForSmokeTest = true
+        #endif
         let graph = NSBezierPath(roundedRect: graphRect, xRadius: 6, yRadius: 6)
         NSColor.controlBackgroundColor.withAlphaComponent(0.35).setFill()
         graph.fill()
@@ -63,7 +69,7 @@ final class MemoryHistoryGraphView: NSView {
         graph.addClip()
         for (index, entry) in history.enumerated() {
             let nextDate = index + 1 < history.count ? history[index + 1].timestamp : now
-            let endDate = min(nextDate, entry.timestamp.addingTimeInterval(30))
+            let endDate = min(nextDate, entry.timestamp.addingTimeInterval(MonitorSampling.maximumGap))
             let left = max(graphRect.minX, xPosition(entry.timestamp))
             let right = min(graphRect.maxX, xPosition(endDate))
             guard right > left else { continue }
@@ -86,7 +92,7 @@ final class MemoryHistoryGraphView: NSView {
             var previous: MemoryHistoryEntry?
             for entry in history where entry.timestamp >= start && entry.timestamp <= now {
                 let point = NSPoint(x: xPosition(entry.timestamp), y: yPosition(entry.snapshot.usedGB))
-                if let previous, entry.timestamp.timeIntervalSince(previous.timestamp) <= 30 {
+                if let previous, entry.timestamp.timeIntervalSince(previous.timestamp) <= MonitorSampling.maximumGap {
                     usage.line(to: point)
                 } else {
                     usage.move(to: point)

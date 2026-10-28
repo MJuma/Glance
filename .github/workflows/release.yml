@@ -1,0 +1,66 @@
+name: Prepare draft release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag (must match VERSION)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: draft-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Strict tests
+        run: swift test -Xswiftc -warnings-as-errors -Xcc -Werror
+      - name: Packaging tests
+        run: swift -swift-version 6 Scripts/test-packaging.swift
+      - name: Release-tag guard tests
+        run: bash Scripts/test-release-guards.sh
+      - name: Format checks
+        run: swift run --package-path BuildTools swiftformat --lint . --swiftversion 6
+      - name: Prepare and verify archives
+        env:
+          GLANCE_RELEASE_TAG: ${{ inputs.tag }}
+          GLANCE_BUILD_NUMBER: ${{ github.run_number }}
+        run: bash Scripts/package-release.sh
+      - name: Retain verified artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: glance-${{ inputs.tag }}
+          path: dist/${{ inputs.tag }}/*
+          if-no-files-found: error
+      - name: Create or update draft only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version=$(cat VERSION)
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then exit 1; fi
+          dist="dist/$RELEASE_TAG"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            if [[ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" != true ]]; then
+              echo "Refusing to overwrite an already published release." >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" "$dist"/*.zip "$dist/SHA256SUMS.txt" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$dist"/*.zip "$dist/SHA256SUMS.txt" \
+              --draft --verify-tag --title "Glance $version" \
+              --notes "Independent Monitor and Time apps. These bundles are ad-hoc signed, not notarized. Build from source or follow macOS trust prompts and your device policies. SHA-256 checksums detect artifact corruption; they do not establish an Apple-trusted publisher identity."
+          fi

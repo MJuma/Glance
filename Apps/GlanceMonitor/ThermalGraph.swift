@@ -1,5 +1,5 @@
 import AppKit
-import OSLog
+import GlanceSupport
 
 struct ThermalGraphData {
     let history: [ThermalHistoryEntry]
@@ -20,8 +20,8 @@ struct ThermalGraphData {
         }
         let temperatures = samples.compactMap(\.cpuMax).filter(\.isFinite)
         if let minimum = temperatures.min(), let maximum = temperatures.max() {
-            let lower = max(30, minimum - 5)
-            temperatureRange = lower...max(lower + 10, min(110, maximum + 5))
+            let lower = max(-40, minimum - 5)
+            temperatureRange = lower...max(lower + 10, min(150, maximum + 5))
         } else {
             temperatureRange = 30...100
         }
@@ -49,6 +49,9 @@ final class ThermalGraphView: NSView {
     private var tracking: NSTrackingArea?
     private var selectedIndex: Int?
     private var hasDrawn = false
+    #if DEBUG
+        var renderedForSmokeTest: Bool { hasDrawn }
+    #endif
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -82,7 +85,7 @@ final class ThermalGraphView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         if !hasDrawn {
-            Logger(subsystem: "com.local.glance.monitor", category: "graphs").debug(
+            AppLog.graphs.debug(
                 "Rendering native thermal history with \(self.data.history.count, privacy: .public) samples"
             )
             hasDrawn = true
@@ -93,7 +96,7 @@ final class ThermalGraphView: NSView {
         for (index, entry) in data.samples.enumerated() {
             let next = index + 1 < data.samples.count
                 ? data.samples[index + 1].timestamp : data.now
-            let end = min(next, entry.timestamp.addingTimeInterval(30))
+            let end = min(next, entry.timestamp.addingTimeInterval(MonitorSampling.maximumGap))
             entry.pressure.color.withAlphaComponent(0.3).setFill()
             NSRect(
                 x: xPosition(entry.timestamp),
@@ -166,7 +169,7 @@ final class ThermalGraphView: NSView {
                 continue
             }
             let point = NSPoint(x: xPosition(entry.timestamp), y: yPosition(reading, range: range))
-            if let previous, entry.timestamp.timeIntervalSince(previous) <= 30 {
+            if let previous, entry.timestamp.timeIntervalSince(previous) <= MonitorSampling.maximumGap {
                 line.line(to: point)
             } else {
                 line.move(to: point)
@@ -174,9 +177,9 @@ final class ThermalGraphView: NSView {
             previous = entry.timestamp
         }
         if let latest = data.samples.last, let reading = value(latest), reading.isFinite {
-            let x = data.now.timeIntervalSince(latest.timestamp) <= 30
+            let x = data.now.timeIntervalSince(latest.timestamp) <= MonitorSampling.maximumGap
                 ? graphRect.maxX : xPosition(latest.timestamp)
-            if data.now.timeIntervalSince(latest.timestamp) <= 30 {
+            if data.now.timeIntervalSince(latest.timestamp) <= MonitorSampling.maximumGap {
                 line.line(to: NSPoint(x: x, y: yPosition(reading, range: range)))
             }
             drawDot(x: x, value: reading, range: range, color: color, radius: dashed ? 3 : 4)
@@ -296,12 +299,16 @@ final class ThermalBreakdownView: NSView {
     override var isFlipped: Bool { true }
 
     init(timeInEachState: [(pressure: ThermalPressure, duration: TimeInterval)], totalDuration: TimeInterval) {
-        rows = [ThermalPressure.nominal, .moderate, .heavy, .critical].map { pressure in
+        var states: [ThermalPressure] = [.nominal, .moderate, .heavy, .critical]
+        if timeInEachState.contains(where: { $0.pressure == .unknown && $0.duration > 0 }) {
+            states.append(.unknown)
+        }
+        rows = states.map { pressure in
             let duration = timeInEachState.first { $0.pressure == pressure }?.duration ?? 0
             let percentage = totalDuration > 0 ? "(\(Int((duration / totalDuration * 100).rounded()))%)" : ""
             return (pressure, Self.formatDuration(duration), percentage)
         }
-        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: 80))
+        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: CGFloat(rows.count) * 15 + 20))
         setAccessibilityElement(true)
         setAccessibilityRole(.staticText)
         setAccessibilityLabel("Thermal time in each state")

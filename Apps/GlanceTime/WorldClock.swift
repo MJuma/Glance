@@ -1,23 +1,51 @@
 import AppKit
 import Foundation
+import GlanceSupport
 import Observation
-import OSLog
 
 struct ClockEntry: Codable, Identifiable {
     let id = UUID()
     var label: String
-    var timezoneID: String
+    let timezoneID: String
     var countryCode: String
+    let timezone: TimeZone
 
     private enum CodingKeys: String, CodingKey {
         case label, timezoneID, countryCode
     }
 
-    var timezone: TimeZone { TimeZone(identifier: timezoneID) ?? .current }
+    init(label: String, timezoneID: String, countryCode: String) throws {
+        guard let timezone = TimeZone(identifier: timezoneID) else {
+            throw ClockSettingsError.invalidTimezone(timezoneID)
+        }
+        self.label = label
+        self.timezoneID = timezoneID
+        self.countryCode = countryCode
+        self.timezone = timezone
+    }
+
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            label: values.decode(String.self, forKey: .label),
+            timezoneID: values.decode(String.self, forKey: .timezoneID),
+            countryCode: values.decode(String.self, forKey: .countryCode)
+        )
+    }
 
     static func cityName(from timezoneID: String) -> String {
         (timezoneID.components(separatedBy: "/").last ?? timezoneID)
             .replacingOccurrences(of: "_", with: " ")
+    }
+}
+
+enum ClockSettingsError: Error, LocalizedError {
+    case invalidTimezone(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .invalidTimezone(identifier): "Unsupported timezone identifier: \(identifier)."
+        }
     }
 }
 
@@ -35,8 +63,7 @@ private func loadTimezoneCountryMap() -> [String: String] {
         }
         return map
     } catch {
-        Logger(subsystem: "com.local.glance.time", category: "timezones")
-            .error("Could not load timezone country labels: \(error.localizedDescription)")
+        AppLog.preferences.error("Could not load timezone country labels: \(error.localizedDescription)")
         return [:]
     }
 }
@@ -56,7 +83,7 @@ final class WorldClockMonitor {
     private(set) var clocks: [ClockEntry] = []
     private(set) var persistenceError: String?
     private let configURL: URL
-    private let logger = Logger(subsystem: "com.local.glance.time", category: "settings")
+    private let logger = AppLog.preferences
     @ObservationIgnored private var preservesUnreadableConfiguration = false
 
     static let countryMap = loadTimezoneCountryMap()
@@ -67,61 +94,55 @@ final class WorldClockMonitor {
             let data = try Data(contentsOf: configURL)
             clocks = try JSONDecoder().decode([ClockEntry].self, from: data)
         } catch CocoaError.fileReadNoSuchFile {
-            clocks = [
-                ClockEntry(label: "Berlin", timezoneID: "Europe/Berlin", countryCode: "DE"),
-                ClockEntry(label: "New York", timezoneID: "America/New_York", countryCode: "US")
-            ]
-            save()
+            do {
+                clocks = try [
+                    ClockEntry(label: "Berlin", timezoneID: "Europe/Berlin", countryCode: "DE"),
+                    ClockEntry(label: "New York", timezoneID: "America/New_York", countryCode: "US")
+                ]
+                save()
+            } catch {
+                persistenceError = "Default clocks could not be created: \(error.localizedDescription)"
+                logger.error("Could not initialize default clocks: \(error.localizedDescription)")
+            }
         } catch {
             preservesUnreadableConfiguration = true
-            persistenceError = "Clock settings could not be loaded. The existing file has been preserved; changes cannot be saved until it is repaired."
+            persistenceError = "Clock settings could not be loaded: \(error.localizedDescription) The existing file has been preserved; repair it and restart before saving changes."
             logger.error("Could not load clock settings: \(error.localizedDescription)")
         }
     }
 
-    func timeString(for clock: ClockEntry, atLocalMinute minute: Int? = nil) -> String {
-        clockTimeString(for: dateForMinute(minute), in: clock.timezone)
+    func timeString(for clock: ClockEntry, at date: Date) -> String {
+        clockTimeString(for: date, in: clock.timezone)
     }
 
-    func hour(for clock: ClockEntry, atLocalMinute minute: Int? = nil) -> Int {
+    func hour(for clock: ClockEntry, at date: Date) -> Int {
         var calendar = Calendar.current
         calendar.timeZone = clock.timezone
-        return calendar.component(.hour, from: dateForMinute(minute))
-    }
-
-    private func dateForMinute(_ minute: Int?) -> Date {
-        let now = Date()
-        guard let minute else { return now }
-        let calendar = Calendar.current
-        let current = calendar.component(.hour, from: now) * 60
-            + calendar.component(.minute, from: now)
-        return now.addingTimeInterval(TimeInterval((minute - current) * 60))
+        return calendar.component(.hour, from: date)
     }
 
     static func isDaytime(hour: Int) -> Bool { hour >= 4 && hour < 21 }
 
-    var currentMinuteOfDay: Int {
-        let calendar = Calendar.current
-        let now = Date()
-        return calendar.component(.hour, from: now) * 60
-            + calendar.component(.minute, from: now)
-    }
-
     var localTimezoneLabel: String {
         let timezone = TimeZone.current
         let abbreviation = timezone.abbreviation() ?? ""
-        let hours = timezone.secondsFromGMT() / 3600
-        return "\(abbreviation), \(hours >= 0 ? "+" : "")\(hours)"
+        return "\(abbreviation), \(ClockTime.utcOffset(seconds: timezone.secondsFromGMT()))"
     }
 
     func addClock(label: String, timezoneID: String) {
         let country = Self.countryMap[timezoneID] ?? ""
-        clocks.append(ClockEntry(
-            label: country.isEmpty ? label : "\(label), \(country)",
-            timezoneID: timezoneID,
-            countryCode: country
-        ))
-        save()
+        do {
+            let clock = try ClockEntry(
+                label: country.isEmpty ? label : "\(label), \(country)",
+                timezoneID: timezoneID,
+                countryCode: country
+            )
+            clocks.append(clock)
+            save()
+        } catch {
+            persistenceError = error.localizedDescription
+            logger.error("Could not add clock: \(error.localizedDescription)")
+        }
     }
 
     func removeClock(at index: Int) {
@@ -166,6 +187,14 @@ final class WorldClockMonitor {
 // MARK: - Time Scrubber
 
 final class TimeScrubber: NSView {
+    var calendar = Calendar.current {
+        didSet {
+            if calendar != oldValue { updateLabels() }
+        }
+    }
+    var referenceDate = Date() {
+        didSet { updateLabels() }
+    }
     var minuteOfDay = 0 {
         didSet {
             guard minuteOfDay != oldValue else { return }
@@ -216,13 +245,8 @@ final class TimeScrubber: NSView {
         guard bounds.width > 0 else { return }
         let width = bounds.width
         let height = bounds.height
-        let calendar = Calendar.current
-        var components = calendar.dateComponents([.year, .month, .day], from: Date())
-        components.hour = minuteOfDay / 60
-        components.minute = minuteOfDay % 60
-        if let date = calendar.date(from: components) {
-            nowLabel.stringValue = clockTimeString(for: date, in: .current)
-        }
+        let date = ClockTime.date(forLocalMinute: minuteOfDay, relativeTo: referenceDate, calendar: calendar)
+        nowLabel.stringValue = clockTimeString(for: date, in: calendar.timeZone)
 
         let thumbX = CGFloat(minuteOfDay) / 1439 * width
         let labelWidth: CGFloat = 60

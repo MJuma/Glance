@@ -1,5 +1,5 @@
 import AppKit
-import OSLog
+import GlanceSupport
 import SwiftUI
 
 @MainActor
@@ -10,6 +10,9 @@ final class AddClockPopover: NSObject, NSPopoverDelegate {
     private var clockWasAdded = false
 
     var hasContent: Bool { popover.contentViewController != nil }
+    #if DEBUG
+        var shownForSmokeTest: Bool { popover.isShown }
+    #endif
 
     init(worldClock: WorldClockMonitor, onAdded: @escaping () -> Void) {
         self.worldClock = worldClock
@@ -22,8 +25,7 @@ final class AddClockPopover: NSObject, NSPopoverDelegate {
 
     func showNear(_ statusItem: NSStatusItem) {
         guard let button = statusItem.button, button.window != nil else {
-            Logger(subsystem: "com.local.glance.time", category: "menus")
-                .error("Cannot open city search because the status button has no window")
+            AppLog.menus.error("Cannot open city search because the status button has no window")
             return
         }
         prepareContent()
@@ -57,8 +59,7 @@ final class AddClockPopover: NSObject, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         popover.contentViewController = nil
-        Logger(subsystem: "com.local.glance.time", category: "menus")
-            .debug("City search closed and content released")
+        AppLog.menus.debug("City search closed and content released")
         if clockWasAdded {
             clockWasAdded = false
             onAdded()

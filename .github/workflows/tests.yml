@@ -1,0 +1,48 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ui_smoke:
+        description: Run UI smoke tests (requires an interactive desktop)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Verify macOS/toolchain
+        run: |
+          test "$(sw_vers -productVersion | cut -d. -f1)" -ge 27
+          xcrun swift --version
+          xcrun --show-sdk-version
+      - name: Strict unit and regression tests
+        run: swift test -Xswiftc -warnings-as-errors -Xcc -Werror
+      - name: Packaging replacement tests
+        run: swift -swift-version 6 Scripts/test-packaging.swift
+      - name: Release-tag guard tests
+        run: bash Scripts/test-release-guards.sh
+      - name: Format checks (developer-only dependency)
+        run: swift run --package-path BuildTools swiftformat --lint . --swiftversion 6
+      - name: Build and verify both local bundles
+        env:
+          GLANCE_BUILD_NUMBER: ${{ github.run_number }}
+        run: bash Scripts/build-apps.sh
+      - name: Optional isolated UI lifecycle smoke tests
+        if: github.event_name == 'workflow_dispatch' && inputs.ui_smoke
+        run: bash Scripts/run-ui-smoke-tests.sh
